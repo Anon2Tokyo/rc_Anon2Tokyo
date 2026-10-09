@@ -12,6 +12,41 @@ business-b → Topic B → 消费者 B ┘                  └→ 线程池 B �
 
 这是单实例 MVP。一次通知允许重复投递；外部业务幂等由供应商负责。自动尝试有限，不保证所有任务最终成功，不保证跨请求顺序。完整设计见 [docs/DESIGN.md](docs/DESIGN.md)，讨论依据、取舍与实现推导见 [plan](docs/plans/http-notification.md)。
 
+## 作业提交内容与阅读入口
+
+本仓库 `rc_Anon2Tokyo` 对应 API 通知系统设计与实现作业。建议按以下顺序阅读，无需依赖开发过程中的聊天记录。
+
+| 作业要求 | 对应文件 | 可以看到什么 |
+| --- | --- | --- |
+| 对问题的理解、整体架构、核心设计 | 本 README、[设计说明](docs/DESIGN.md) | 服务定位、责任边界、接入与投递主链路、数据与协议 |
+| 可靠性、失败处理、取舍与演进 | [设计说明](docs/DESIGN.md) | 投递语义、崩溃窗口、重试终止、替代方案和演进条件 |
+| 最小可行代码实现 | [业务代码](src/main/java/io/anon/notify)、[配置与表结构](src/main/resources)、[本地运行配置](compose.yml) | 一个可运行的 Spring Boot 服务及其依赖 |
+| AI 在哪些关键地方提供帮助 | [AI 使用说明](AI_USAGE.md) | AI 参与阶段、未采纳的建议、开发者的决定及取舍依据 |
+| 验证依据（补充材料） | [验证记录](docs/VERIFICATION.md)、[测试代码](src/test/java/io/anon/notify) | 21 个测试、真实中间件链路及进程恢复验证、未验证范围 |
+| 设计与实现推导（补充材料） | [plan](docs/plans/http-notification.md) | 每轮决策、理由、动作及代码落点 |
+
+`设计方案模版.md` 是设计过程的参考提纲；正式提交说明以 `docs/DESIGN.md` 为准。`AGENTS.md` 保存开发流程约定，不属于运行依赖。
+
+## 我对问题的理解
+
+业务系统希望把“调用外部 API”这个不稳定、可能耗时的动作交给内部服务。核心问题是外部接口超时、拒绝或长期不可用时，任务能否被保留、区分结果并继续处理，而不只是完成一次 HTTP 转发。
+
+“业务系统不关心返回值”不代表中台忽略返回值：上游无需处理供应商结果，中台仍需结合 HTTP 状态和供应商业务码判断成功。题目没有提供真实供应商协议，本实现通过两个模拟协议验证差异，不宣称已经接入真实 CRM 或广告系统。
+
+第一版选择 MQ 作为上游入口，选择由中台组装供应商请求，而不是提供任意 URL 的通用代理。当前范围是两个预配置业务来源、两个模拟供应商、一个“更新客户状态”操作。
+
+## 第一版的重要取舍
+
+| 决定 | 为什么这样做 | 付出的代价 / 限制 |
+| --- | --- | --- |
+| 任务落库后确认 MQ 消费 | 把接收与外部调用分开，明确重试状态及恢复依据 | 多一个数据库和后台扫描流程 |
+| 按业务方隔离消费及投递资源 | 不同业务触发频率不同，限制彼此挤占 | 仍共享进程、Broker、数据库；不是完整多租户隔离 |
+| 中台维护两套供应商协议 | 上游不用组装不同 Header/Body 和解析响应 | 新供应商需要中台适配代码 |
+| 有限重试、失败保留、人工重投 | 长期故障时控制资源消耗并保留恢复入口 | 不承诺永久故障下自动成功 |
+| 单实例加启动恢复 | 首先证明进程故障后的恢复逻辑 | 停机期间暂停投递，无多实例高可用 |
+
+这些是已经实现的选择。动态租户、顺序保证、多实例调度、供应商级配额和管理页面没有包含在 MVP 中。中间件选择、替代方案及演进触发条件详见设计说明。
+
 ## 本地运行
 
 需要 Java 17、Maven 3.9、Docker Compose；演示供应商和冒烟脚本另需 Python 3。以下命令在仓库根目录执行。Compose 端口仅绑定本机，RocketMQ 对外通告地址也是 127.0.0.1，因此应用应在宿主机运行。
@@ -48,9 +83,12 @@ mvn -q exec:java '-Dexec.mainClass=io.anon.notify.DemoPublisher' '-Dexec.classpa
 
 示例发送端同步检查 SEND_OK；真实上游还须自行处理业务事务与发布的一致性。Broker 在演示配置中使用 SYNC_FLUSH，但单 Broker 没有节点容灾能力。
 
-5. 查询和重投：
+此处打印发送成功只代表 MQ 发布结果，不代表供应商已经处理完成；最终投递状态通过下方任务查询检查。
+
+5. 在另一个操作终端查询和重投，令牌须与运行中台的终端保持一致：
 
 ```powershell
+$env:OPS_TOKEN = 'local-demo-ops-token-change-me'
 $headers = @{ 'X-Ops-Token' = $env:OPS_TOKEN }
 Invoke-RestMethod 'http://127.0.0.1:8080/internal/tasks/business-a/contact-update-001' -Headers $headers
 Invoke-RestMethod 'http://127.0.0.1:8080/internal/status' -Headers $headers
@@ -81,6 +119,31 @@ Invoke-RestMethod 'http://127.0.0.1:8080/internal/tasks/business-a/contact-updat
 
 默认每业务 1 个消费线程、2 个投递线程，500ms 扫描一次；HTTP 超时 5s。配置在 `application.yml`，可用 Spring 配置覆盖。测试可使用 `--notification.retry-delays=100ms,200ms,300ms,400ms`。尝试上限为“间隔数量 + 1”。
 
+### 一次可复现的失败与人工重投演示
+
+在中台和模拟供应商已运行的情况下，用新标识发送一个确定失败的任务。这里用不可恢复错误演示，避免等待完整自动重试周期。
+
+```powershell
+New-Item -ItemType Directory -Force target | Out-Null
+$requestId = 'demo-reject-' + [guid]::NewGuid().ToString('N')
+$message = @{
+    requestId = $requestId
+    supplier = 'supplier-b'
+    operation = 'UPDATE_CONTACT_STATUS'
+    payload = @{ contactId = 'reject-c001'; status = 'ACTIVE' }
+} | ConvertTo-Json -Depth 3
+# PowerShell 5 的 -Encoding UTF8 会写 BOM，这里明确生成无 BOM 的 UTF-8 消息。
+[IO.File]::WriteAllText((Join-Path $PWD 'target/demo-reject.json'), $message, [Text.UTF8Encoding]::new($false))
+mvn -q exec:java '-Dexec.mainClass=io.anon.notify.DemoPublisher' '-Dexec.classpathScope=test' '-Dexec.args=127.0.0.1:9876 notify-business-b target/demo-reject.json'
+$uri = "http://127.0.0.1:8080/internal/tasks/business-b/$requestId"
+Invoke-RestMethod $uri -Headers $headers
+# 确认状态为 FAILED 后再执行；消费/投递异步，刚发送时可能暂时查不到或仍在执行。
+Invoke-RestMethod "$uri/retry" -Method Post -Headers $headers
+Invoke-RestMethod $uri -Headers $headers
+```
+
+第一次最终状态为 FAILED、attemptCount=1。重投后 replayCount=1，原参数不变，模拟供应商会再次拒绝，最终 totalAttempts=2。这说明人工重投是重新尝试，不是把任务强制改成成功。实际恢复应先修好外部故障或配置；若业务参数错误，上游须修正参数并提交新 requestId。
+
 ## 两种失败恢复
 
 **HTTP 失败任务**已经在 MySQL 中，使用上面的运维查询/重投接口。没有自动清理失败任务；第一版只保留当前状态和最近错误，没有完整逐次审计历史。
@@ -101,6 +164,8 @@ Broker 的消息文件保留时间示例为 72 小时，磁盘压力等因素也
 若 `/internal/status` 返回 503，说明投递过程中数据库状态不确定或发生异常，系统已停止新增投递。先查看日志并恢复数据库/配置，再确认旧实例退出后重启；启动恢复不会自动重投 FAILED。不要同时启动两个实例操作同一任务库。
 
 ## 验证
+
+已完成的验证记录于 2026-10-09，代码基线为 `fcbbe36`：快速测试 21 项通过、同一套测试在真实 MySQL 上通过、真实 RocketMQ→MySQL→模拟 HTTP 链路及进程恢复通过。详细证据、每项验收与测试的对应关系见 [docs/VERIFICATION.md](docs/VERIFICATION.md)。本次补充说明不代表新增一次中间件测试运行。
 
 快速测试（H2 MySQL 模式＋真实本地 HTTP 服务，**不代表真实 MQ/MySQL 验证**）：
 
@@ -124,6 +189,7 @@ Remove-Item Env:NOTIFICATION_TEST_DB_URL,Env:NOTIFICATION_TEST_DB_USER,Env:NOTIF
 完整冒烟（先关闭手工启动的中台和模拟供应商，避免单实例/端口冲突）：
 
 ```powershell
+powershell -ExecutionPolicy Bypass -File scripts/setup-local.ps1
 mvn -B package
 mvn -q dependency:build-classpath '-Dmdep.outputFile=target/test-classpath.txt' '-Dmdep.includeScope=test'
 python scripts/smoke_test.py
@@ -132,6 +198,8 @@ python scripts/smoke_test.py
 脚本启动自己的 Java 和模拟供应商进程，端口为 18080/18081/18082，验证两业务×两供应商、重复消息、重试耗尽、人工重投、真实进程强制结束后的恢复及运维访问限制。任务使用唯一前缀保留在本地 notifications 库，日志放在 target/smoke；结束时关闭脚本自己的进程，不删除数据库或 MQ 数据。非法消息另用上述命令核查死信。
 
 运行结束可用 `docker compose stop` 停止本项目基础设施，保留数据卷。
+
+提交时保留源代码、配置、示例、脚本和说明即可，jar、测试报告原件、运行日志、临时文件及本地环境变量由 `.gitignore` 排除。测试报告的可审阅摘要保存在版本管理内的验证记录中，克隆仓库后可用上述命令重新生成原件。
 
 ## 代码阅读顺序
 
