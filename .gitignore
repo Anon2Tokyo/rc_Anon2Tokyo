@@ -23,3 +23,5 @@ Desktop.ini
 *~
 tmp/
 temp/
+target/
+__pycache__/

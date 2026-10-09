@@ -1,0 +1,6 @@
+{
+  "requestId": "contact-update-001",
+  "supplier": "supplier-a",
+  "operation": "UPDATE_CONTACT_STATUS",
+  "payload": { "contactId": "c-001", "status": "ACTIVE" }
+}

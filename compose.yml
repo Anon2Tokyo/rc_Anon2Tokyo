@@ -1,0 +1,45 @@
+name: anon-http-notification
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: notifications
+      MYSQL_USER: notify
+      MYSQL_PASSWORD: ${DB_PASSWORD:-notify-local}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-root-local-only}
+    ports: ["127.0.0.1:3307:3306"]
+    volumes: ["mysql-data:/var/lib/mysql"]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  namesrv:
+    image: apache/rocketmq:5.3.2
+    command: sh mqnamesrv
+    environment:
+      JAVA_OPT_EXT: "-Xms128m -Xmx128m -Xmn64m"
+    ports: ["127.0.0.1:9876:9876"]
+  broker:
+    image: apache/rocketmq:5.3.2
+    command: sh mqbroker -c /home/rocketmq/broker.conf
+    depends_on:
+      namesrv:
+        condition: service_started
+      broker-store-init:
+        condition: service_completed_successfully
+    environment:
+      JAVA_OPT_EXT: "-Xms256m -Xmx256m -Xmn128m -XX:MaxDirectMemorySize=256m"
+    ports: ["127.0.0.1:10911:10911", "127.0.0.1:10909:10909"]
+    volumes:
+      - ./infra/broker.conf:/home/rocketmq/broker.conf:ro
+      - rocketmq-data:/home/rocketmq/store
+  broker-store-init:
+    image: apache/rocketmq:5.3.2
+    user: root
+    entrypoint: ["sh", "-c"]
+    command: ["chown rocketmq:rocketmq /home/rocketmq/store"]
+    volumes: ["rocketmq-data:/home/rocketmq/store"]
+volumes:
+  mysql-data:
+  rocketmq-data:
